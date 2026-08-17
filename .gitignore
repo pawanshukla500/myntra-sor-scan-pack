@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PyInstaller output
+.build-dist/
+.build-spec/
+.build-work/
+*.spec
+*.exe
+.embedded.env
+
+# Local secrets and operator state
+.env
+.env.*
+!.env.example
+myntra_manual_config.json
+data/
+downloads/
