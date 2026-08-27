@@ -246,12 +246,13 @@ def first_run_setup(path: Path, config: dict[str, Any], consignment_override: st
     db = input("Consignment database URL: ").strip()
     if not db:
         raise RuntimeError("A Consignment database URL is required")
-    email = input("Myntra partner email (optional for manual sign-in): ").strip()
-    password = getpass.getpass("Myntra partner password (optional for manual sign-in): ") if email else ""
+    email = input("Myntra partner email (optional; saved encrypted): ").strip()
+    password = getpass.getpass("Myntra partner password (optional; saved encrypted): ") if email else ""
     config.update({
         "consignment_database_url": db,
         "myntra_email": email,
         "myntra_password": password,
+        "auto_login": False,
         "consignment": consignment_override or config.get("consignment") or "MYNJ-VBXOEO240726-16",
     })
     save_runtime_config(path, config)
@@ -742,23 +743,18 @@ def live_login_page(context, preferred=None):
         candidates.append(preferred)
     candidates.extend(reversed(list(context.pages)))
     seen = set()
-    # Prefer the credential form over the original method-selection page.
-    # Myntra can keep the first page alive while mounting /emaillogin in a
-    # second tab, so checking the selection button first can loop forever.
+    # Prefer the credential form. Myntra can leave the method selector open
+    # while mounting /emaillogin in another page or frame.
     for candidate in candidates:
         marker = id(candidate)
         if marker in seen or candidate.is_closed():
             continue
         seen.add(marker)
         try:
-            url = candidate.url
-            if "accounts.myntra.com" not in url:
-                continue
-            if login_form_frame(candidate) is not None:
+            if "accounts.myntra.com" in candidate.url and login_form_frame(candidate) is not None:
                 return candidate
         except PlaywrightError:
             continue
-    # If the form has not mounted yet, use the page with the method selector.
     seen.clear()
     for candidate in candidates:
         marker = id(candidate)
@@ -766,7 +762,7 @@ def live_login_page(context, preferred=None):
             continue
         seen.add(marker)
         try:
-            if "accounts.myntra.com" in candidate.url and visible_text(candidate, "Use Email And Password", False):
+            if "accounts.myntra.com" in candidate.url:
                 return candidate
         except PlaywrightError:
             continue
@@ -774,7 +770,7 @@ def live_login_page(context, preferred=None):
 
 
 def login_form_frame(page):
-    """Find the SSO form in the page or an embedded frame."""
+    """Find the Myntra email/password form in the page or an embedded frame."""
     try:
         for frame in page.frames:
             if frame.locator("#email").count() and frame.locator("#password").count():
@@ -784,6 +780,113 @@ def login_form_frame(page):
     return None
 
 
+def chrome_executable(playwright) -> Path:
+    """Return an installed Chrome executable for the operator-driven login."""
+    configured = str(os.getenv("MYNTRA_PARTNER_CHROME_PATH") or "").strip()
+    candidates = [
+        Path(configured) if configured else None,
+        Path(os.getenv("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.getenv("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.getenv("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(playwright.chromium.executable_path),
+    ]
+    for candidate in candidates:
+        if candidate is not None and candidate.is_file():
+            return candidate.resolve()
+    raise RuntimeError("Google Chrome was not found. Install Chrome or set MYNTRA_PARTNER_CHROME_PATH.")
+
+
+def human_login_debug_port() -> int:
+    """Use a stable local port so an intentionally left-open login can be resumed."""
+    try:
+        port = int(os.getenv("MYNTRA_PARTNER_CHROME_DEBUG_PORT", "9331"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("MYNTRA_PARTNER_CHROME_DEBUG_PORT must be a number") from exc
+    if not 1024 <= port <= 65535:
+        raise RuntimeError("MYNTRA_PARTNER_CHROME_DEBUG_PORT must be between 1024 and 65535")
+    return port
+
+
+def launch_human_login_browser(playwright, log_callback=None):
+    """Launch normal Chrome with a persistent profile, then attach for packing.
+
+    Chrome—not Playwright—owns the browser process and profile. Playwright is
+    attached only to observe completion and to run the existing packing flow;
+    it never fills, clicks, or submits the Myntra authentication form.
+    """
+    import subprocess
+
+    def progress(message: str) -> None:
+        if log_callback:
+            log_callback(message)
+        else:
+            print(message)
+
+    port = human_login_debug_port()
+    endpoint = f"http://127.0.0.1:{port}"
+    browser = None
+    try:
+        browser = playwright.chromium.connect_over_cdp(endpoint, timeout=1_500)
+        progress("Reusing the dedicated Myntra Chrome session")
+    except PlaywrightError:
+        chrome = chrome_executable(playwright)
+        profile = Path(os.getenv("LOCALAPPDATA") or application_dir()) / "MyntraPartnerManual" / "ChromeProfile"
+        profile.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(chrome),
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-notifications",
+            "--window-size=1366,900",
+            "--new-window",
+            LOGIN_URL,
+        ]
+        proxy = str(os.getenv("MYNTRA_PARTNER_PROXY") or "").strip()
+        if proxy:
+            command.insert(-2, f"--proxy-server={proxy}")
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            try:
+                browser = playwright.chromium.connect_over_cdp(endpoint, timeout=1_500)
+                break
+            except PlaywrightError:
+                time.sleep(0.35)
+        if browser is None:
+            raise RuntimeError(
+                "Could not connect to the dedicated Myntra Chrome window. "
+                "Close any existing Myntra login Chrome window and try again."
+            )
+        progress("Opened a dedicated Chrome profile for manual Myntra sign-in")
+
+    if not browser.contexts:
+        raise RuntimeError("The dedicated Myntra Chrome session has no browser context")
+    context = browser.contexts[0]
+    pages = [candidate for candidate in context.pages if not candidate.is_closed()]
+    page = next(
+        (candidate for candidate in reversed(pages) if "myntra" in candidate.url.lower()),
+        pages[-1] if pages else context.new_page(),
+    )
+    return browser, context, page
+
+
+def close_human_login_browser(browser, context) -> None:
+    """Close the external Chrome process, not only Playwright's CDP connection."""
+    try:
+        pages = [candidate for candidate in context.pages if not candidate.is_closed()]
+        if pages:
+            session = context.new_cdp_session(pages[0])
+            session.send("Browser.close")
+            return
+    except PlaywrightError:
+        pass
+    browser.close()
+
+
 def emit(args: argparse.Namespace, message: str) -> None:
     print(message)
     callback = getattr(args, "log_callback", None)
@@ -791,8 +894,16 @@ def emit(args: argparse.Namespace, message: str) -> None:
         callback(message)
 
 
-def wait_for_portal(context, login_page, auto_login: bool, email: str | None, password: str | None, gui: bool = False, log_callback=None):
-    """Complete Myntra SSO, then return a fresh visible Scan & Pack tab."""
+def wait_for_portal(
+    context,
+    login_page,
+    auto_login: bool,
+    email: str | None,
+    password: str | None,
+    gui: bool = False,
+    log_callback=None,
+):
+    """Complete Myntra SSO, then return the ready Scan & Pack page."""
     def progress(message: str) -> None:
         if log_callback:
             log_callback(message)
@@ -800,9 +911,9 @@ def wait_for_portal(context, login_page, auto_login: bool, email: str | None, pa
             print(message)
 
     try:
-        login_timeout = max(60, float(os.getenv("MYNTRA_PARTNER_LOGIN_TIMEOUT_S", "240")))
+        login_timeout = max(60, float(os.getenv("MYNTRA_PARTNER_LOGIN_TIMEOUT_S", "600")))
     except (TypeError, ValueError):
-        login_timeout = 240.0
+        login_timeout = 600.0
     deadline = time.monotonic() + login_timeout
     mode_clicked = False
     submitted = False
@@ -839,46 +950,42 @@ def wait_for_portal(context, login_page, auto_login: bool, email: str | None, pa
                         progress("Selected Use Email And Password")
                     except PlaywrightError:
                         pass
+
                 form_frame = login_form_frame(login_page)
-                email_field = form_frame.locator("#email").first if form_frame is not None else login_page.locator("#email").first
-                password_field = form_frame.locator("#password").first if form_frame is not None else login_page.locator("#password").first
+                form = form_frame if form_frame is not None else login_page
+                email_field = form.locator("#email").first
+                password_field = form.locator("#password").first
                 fields_ready = False
                 if email_field.count() and password_field.count():
                     try:
-                        # The form is mounted asynchronously after the mode
-                        # button click. Waiting for visibility avoids a race
-                        # where the URL is still the SSO page but the fields
-                        # have not entered the DOM yet.
                         email_field.wait_for(state="visible", timeout=2_000)
                         password_field.wait_for(state="visible", timeout=2_000)
                         fields_ready = True
                     except PlaywrightError:
                         fields_ready = False
+
                 if fields_ready:
                     can_retry = submitted and submit_attempts < 2 and (time.monotonic() - last_submit_at) >= 8
                     if auto_login and email and password and (not submitted or can_retry):
                         progress("Myntra login form is ready; entering saved credentials")
                         email_field.fill(email)
                         password_field.fill(password)
-                        login_button = (form_frame if form_frame is not None else login_page).locator(
-                            "button.global_actionButton__L2wUb, button.global_actionButton__rKxIQ, button:has-text('LOG IN')"
+                        login_button = form.locator(
+                            "button.global_actionButton__L2wUb, "
+                            "button.global_actionButton__rKxIQ, "
+                            "button:has-text('LOG IN'), button[type='submit'], input[type='submit']"
                         ).first
                         login_button.wait_for(state="visible", timeout=10_000)
                         login_button.click()
                         submitted = True
                         submit_attempts += 1
                         last_submit_at = time.monotonic()
-                        if submit_attempts == 1:
-                            progress("Submitted Myntra login; waiting for partner portal")
-                        else:
-                            progress("Myntra SSO did not redirect; retrying login submission once")
-                    elif not auto_login and not prompted:
-                        if gui:
-                            if log_callback:
-                                log_callback("Myntra login form is ready. Automatic sign-in is disabled; complete sign-in in the visible browser.")
-                        else:
-                            print("Myntra login is open in Chrome. Complete sign-in manually, then return here.")
-                            input("Press Enter after the Myntra portal shows Scan & Pack: ")
+                        progress("Submitted Myntra login; waiting for partner portal")
+                    elif (not auto_login or not email or not password) and not prompted:
+                        progress(
+                            "Complete Myntra sign-in in Chrome. "
+                            "The app will continue automatically when Scan & Pack is ready."
+                        )
                         prompted = True
         except PlaywrightError:
             # A redirect can destroy the execution context for one polling tick.
@@ -981,25 +1088,10 @@ def run(args: argparse.Namespace) -> None:
         emit(args, f"Saved active consignment lock: {code}")
 
     with sync_playwright() as playwright:
-        launch_kwargs = {
-            "headless": False,
-            # Myntra requests browser notifications on the first visit. That
-            # permission sheet can cover the Scan & Pack modal and prevent
-            # the Road/carton controls from receiving clicks. Suppress it for
-            # this automation context; no Windows/browser permission is changed.
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-notifications",
-            ],
-        }
-        if os.getenv("MYNTRA_PARTNER_PROXY"):
-            launch_kwargs["proxy"] = {"server": os.getenv("MYNTRA_PARTNER_PROXY")}
-        try:
-            browser = playwright.chromium.launch(channel="chrome", **launch_kwargs)
-        except Exception:
-            browser = playwright.chromium.launch(**launch_kwargs)
-        context = browser.new_context(viewport={"width": 1366, "height": 900}, locale="en-IN")
-        page = context.new_page()
+        browser, context, page = launch_human_login_browser(
+            playwright,
+            log_callback=getattr(args, "log_callback", None),
+        )
         success = False
 
         def portal_click(text: str, exact: bool = True) -> None:
@@ -1015,7 +1107,15 @@ def run(args: argparse.Namespace) -> None:
                 click_text(page, text, exact=exact)
 
         try:
-            page = wait_for_portal(context, page, auto_login, email, password, gui=getattr(args, "gui", False), log_callback=getattr(args, "log_callback", None))
+            page = wait_for_portal(
+                context,
+                page,
+                auto_login,
+                email,
+                password,
+                gui=getattr(args, "gui", False),
+                log_callback=getattr(args, "log_callback", None),
+            )
             page = ready_portal_page(context, page) or page
             if getattr(args, "portal_only", False):
                 emit(args, "LOGIN VERIFIED: Myntra Scan & Pack is ready; packing was not started.")
@@ -1107,14 +1207,14 @@ def run(args: argparse.Namespace) -> None:
             raise
         finally:
             if getattr(args, "gui", False) and success:
-                browser.close()
+                close_human_login_browser(browser, context)
             elif args.close_on_success and success:
-                browser.close()
+                close_human_login_browser(browser, context)
             elif getattr(args, "portal_only", False):
-                browser.close()
+                close_human_login_browser(browser, context)
             elif not getattr(args, "gui", False):
                 input("Press Enter to close the local Myntra browser: ")
-                browser.close()
+                close_human_login_browser(browser, context)
 
 
 def run_gui(args: argparse.Namespace) -> None:
@@ -1330,7 +1430,12 @@ def run_gui(args: argparse.Namespace) -> None:
             messagebox.showerror("Database URL required", "Enter the Consignment CockroachDB URL once. It will be encrypted for this Windows user.", parent=root)
             return
         new_config = dict(runtime_config)
-        new_config.update({"consignment_database_url": db, "myntra_email": email_var.get().strip(), "myntra_password": password_var.get(), "auto_login": bool(auto_login_var.get())})
+        new_config.update({
+            "consignment_database_url": db,
+            "myntra_email": email_var.get().strip(),
+            "myntra_password": password_var.get(),
+            "auto_login": bool(auto_login_var.get()),
+        })
         try:
             save_runtime_config(config_path, new_config)
             os.environ["CONSIGMENT_APP_DATABASE_URL"] = db
@@ -1353,13 +1458,22 @@ def run_gui(args: argparse.Namespace) -> None:
 
     ttk.Label(settings_tab, text="Consignment database URL (saved encrypted with Windows DPAPI)").pack(anchor="w")
     ttk.Entry(settings_tab, textvariable=db_var, width=110, show="•").pack(fill="x", pady=(4, 12))
-    ttk.Label(settings_tab, text="Myntra partner email").pack(anchor="w")
+    ttk.Label(settings_tab, text="Myntra partner email (saved encrypted)").pack(anchor="w")
     ttk.Entry(settings_tab, textvariable=email_var, width=70).pack(fill="x", pady=(4, 12))
-    ttk.Label(settings_tab, text="Myntra partner password").pack(anchor="w")
+    ttk.Label(settings_tab, text="Myntra partner password (saved encrypted)").pack(anchor="w")
     ttk.Entry(settings_tab, textvariable=password_var, width=70, show="•").pack(fill="x", pady=(4, 12))
-    ttk.Checkbutton(settings_tab, text="Use saved credentials for automatic sign-in (otherwise sign in visibly)", variable=auto_login_var).pack(anchor="w", pady=(0, 14))
+    ttk.Checkbutton(
+        settings_tab,
+        text="Use saved credentials for automatic sign-in",
+        variable=auto_login_var,
+    ).pack(anchor="w", pady=(0, 12))
     ttk.Button(settings_tab, text="Save encrypted settings", command=save_settings).pack(anchor="w")
-    ttk.Label(settings_tab, text="The database URL and credentials are never written in plaintext to the config file.", foreground="#555").pack(anchor="w", pady=(16, 0))
+    ttk.Label(
+        settings_tab,
+        text="Myntra opens in a dedicated visible Chrome profile. If automatic sign-in is disabled or Myntra asks for verification, complete it in Chrome.",
+        foreground="#555",
+    ).pack(anchor="w", pady=(16, 0))
+    ttk.Label(settings_tab, text="The database URL and credentials are never written in plaintext to the config file.", foreground="#555").pack(anchor="w", pady=(6, 0))
 
     controls = ttk.Frame(packing_tab)
     controls.pack(fill="x", pady=(10, 0))
@@ -1386,7 +1500,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manually pack one Myntra consignment from the local network")
     parser.add_argument("--consignment", help="Exact consignment code; defaults to the config file")
     parser.add_argument("--max-boxes", type=int, help="Test only the first 1 or 2 cartons; never writes completion")
-    parser.add_argument("--auto-login", action="store_true", help="Use MYNTRA_PARTNER_EMAIL/PASSWORD instead of manual sign-in")
+    parser.add_argument("--auto-login", action="store_true", help="Deprecated compatibility option; sign-in is always manual")
     parser.add_argument("--yes", action="store_true", help="Skip the final PACK confirmation")
     parser.add_argument("--force", action="store_true", help="Ignore this script's local completion marker")
     parser.add_argument("--close-on-success", action="store_true", help="Close Chrome after all cartons finish")

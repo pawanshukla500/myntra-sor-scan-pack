@@ -12,7 +12,8 @@ Windows GUI for loading Myntra SOR consignments from a read-only Consignment dat
 - Filters the GUI by scenario while retaining database and local run status.
 - Validates carton quantities and barcode items before opening the portal.
 - Stores an active-run lock and local completion history to prevent accidental duplicate packing.
-- Encrypts the database URL and Myntra credentials with Windows DPAPI.
+- Encrypts the database URL and optional Myntra credentials with Windows DPAPI.
+- Opens a dedicated, persistent Chrome profile and can submit the saved Myntra credentials.
 - Uses read-only database transactions and does not update Consignment records.
 
 ## Run from source
@@ -31,7 +32,7 @@ Windows GUI for loading Myntra SOR consignments from a read-only Consignment dat
    python myntra_manual.py --app
    ```
 
-4. Open **Settings**, enter the Consignment database URL and optional Myntra Partner credentials, then save. Secrets are encrypted for the current Windows user.
+4. Open **Settings** to review the encrypted Consignment database URL and Myntra Partner credentials. Automatic sign-in can be enabled there; any verification challenge remains visible for the operator to complete in Chrome.
 
 ## Build the Windows executable
 
