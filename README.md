@@ -9,9 +9,9 @@ Windows GUI for loading Myntra SOR consignments from a read-only Consignment dat
   - Under packing
   - Packed · pending invoice
   - Ready for dispatch
-- Filters the GUI by scenario while retaining database and local run status.
+- Filters the GUI by scenario without applying local completion restrictions.
 - Validates carton quantities and barcode items before opening the portal.
-- Stores an active-run lock and local completion history to prevent accidental duplicate packing.
+- Allows every shipment to be started repeatedly, regardless of prior local runs.
 - Encrypts the database URL and optional Myntra credentials with Windows DPAPI.
 - Opens a dedicated, persistent Chrome profile and can submit the saved Myntra credentials.
 - Uses read-only database transactions and does not update Consignment records.

@@ -363,9 +363,9 @@ def is_packed_pending_invoice(data: dict[str, Any]) -> bool:
 def read_eligible_consignments(limit: int | None = None, state_path: Path | None = None) -> list[dict[str, Any]]:
     """Return all consignments for the configured Myntra SOR marketplace."""
     max_rows = None if limit is None else max(int(limit), 1)
-    state = read_state(state_path or DEFAULT_STATE)
-    completed = set(state.get("completed", []))
-    locked_code = active_code(state)
+    # Keep state_path in the public signature for older callers. Local run
+    # history is deliberately ignored: every database row is always runnable.
+    _ = state_path
     target_marketplace = normalize_status(os.getenv("MYNTRA_PARTNER_MARKETPLACE", "Myntra SOR"))
     with connect_db() as conn:
         with conn.cursor() as cur:
@@ -409,17 +409,6 @@ def read_eligible_consignments(limit: int | None = None, state_path: Path | None
                 ).strip()
                 if not code:
                     continue
-                normalized_code = code.lower()
-                local_completed = normalized_code in completed
-                is_active = normalized_code == locked_code
-                if local_completed:
-                    local_state = "Completed on this PC"
-                elif is_active:
-                    local_state = "In progress · resume"
-                elif locked_code:
-                    local_state = f"Waiting for {locked_code}"
-                else:
-                    local_state = "Available"
                 results.append({
                     "code": code,
                     "shipment": data.get("shipmentNo") or data.get("internalShipmentNo") or "",
@@ -431,10 +420,6 @@ def read_eligible_consignments(limit: int | None = None, state_path: Path | None
                     "shipmentStatus": data.get("shipmentStatus") or "",
                     "packedQty": number(data.get("totalPackedQty", data.get("packedQty"))),
                     "requiredQty": number(data.get("totalRequiredQty", data.get("requiredQty"))),
-                    "active": is_active,
-                    "localCompleted": local_completed,
-                    "localState": local_state,
-                    "canPack": not local_completed and (not locked_code or is_active),
                 })
                 if max_rows is not None and len(results) >= max_rows:
                     break
@@ -549,10 +534,10 @@ def empty_state() -> dict[str, Any]:
 def read_state(path: Path) -> dict[str, Any]:
     """Read durable packing state and migrate the original list format.
 
-    Older builds wrote a JSON array containing completed consignment IDs.  The
-    new format keeps that history plus one active consignment lock.  A malformed
-    or missing file is treated as empty so a damaged local cache never makes a
-    consignment permanently disappear from the selector.
+    Older builds wrote a JSON array containing completed consignment IDs. The
+    current format retains legacy history plus optional run progress, but this
+    data never controls whether a consignment may be started again. A malformed
+    or missing file is treated as empty.
     """
     source_path = path
     if not path.exists() and path.name == "myntra-manual-state.json":
@@ -1019,23 +1004,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("Consignment ID is required")
     state_path = Path(args.state_file)
     state = read_state(state_path)
-    completed = set(state.get("completed", []))
     normalized_code = code.lower()
-    locked_code = active_code(state)
-    if normalized_code in completed and not args.force:
-        raise RuntimeError(f"{code} is already marked complete in {state_path} and cannot be packed twice")
-    if locked_code and locked_code != normalized_code and not args.force:
-        raise RuntimeError(
-            f"{locked_code} is still in progress. Finish or clear that consignment before starting {code}."
-        )
-    existing_active = state.get("active") if isinstance(state.get("active"), dict) else {}
-    if (
-        locked_code == normalized_code
-        and str(existing_active.get("mode") or "full").lower() == "full"
-        and args.max_boxes
-        and not args.force
-    ):
-        raise RuntimeError(f"{code} already has a full run in progress; use Start full packing to resume it")
     plan = read_plan(code)
     boxes = plan["boxes"][: args.max_boxes] if args.max_boxes else plan["boxes"]
     units = sum(box["totalUnits"] for box in boxes)
@@ -1063,13 +1032,16 @@ def run(args: argparse.Namespace) -> None:
     if auto_login and not password:
         password = getpass.getpass("Myntra partner password: ")
 
-    # Both test and full runs acquire the lock.  A test clears it after its
-    # selected cartons finish; a full run keeps it through every failure and
-    # restart until every carton is closed successfully.
+    # Progress is retained for recovery and diagnostics only. It never locks a
+    # consignment or prevents any shipment from being started again.
     tracking_run = not bool(args.portal_only)
     tracking_full_run = tracking_run and not bool(args.max_boxes)
     if tracking_run:
-        previous_active = dict(state.get("active") or {})
+        previous_active = (
+            dict(state.get("active") or {})
+            if active_code(state) == normalized_code
+            else {}
+        )
         active = {
             **previous_active,
             "code": normalized_code,
@@ -1085,7 +1057,7 @@ def run(args: argparse.Namespace) -> None:
         }
         state["active"] = active
         write_state(state_path, state)
-        emit(args, f"Saved active consignment lock: {code}")
+        emit(args, f"Saved run progress: {code}")
 
     with sync_playwright() as playwright:
         browser, context, page = launch_human_login_browser(
@@ -1185,19 +1157,15 @@ def run(args: argparse.Namespace) -> None:
                 page.wait_for_timeout(500)
             success = len(boxes) == len(plan["boxes"])
             if success:
-                completed.add(code.lower())
-                state["completed"] = sorted(completed)
                 state["active"] = None
                 write_state(state_path, state)
                 emit(args, f"COMPLETED: {code} ({units} units)")
             elif tracking_run and args.max_boxes:
-                # A successful test is deliberately not a completion.  It is
-                # safe to offer this consignment again for the full run.
                 state["active"] = None
                 write_state(state_path, state)
-                emit(args, f"TEST COMPLETED: {code} ({units} units); completion marker was not written")
+                emit(args, f"TEST COMPLETED: {code} ({units} units); this shipment remains runnable")
             else:
-                emit(args, "PARTIAL RUN FINISHED; completion marker was not written.")
+                emit(args, "PARTIAL RUN FINISHED; this shipment remains runnable.")
         except Exception:
             try:
                 page.screenshot(path=str(Path(args.screenshot_dir) / f"{code}-failure.png"), full_page=True)
@@ -1282,18 +1250,17 @@ def run_gui(args: argparse.Namespace) -> None:
     scenario_filter.pack(side="left", padx=(6, 12))
     ttk.Label(filters, textvariable=result_summary_var).pack(side="right")
 
-    columns = ("code", "shipment", "warehouse", "scenario", "db_status", "packed", "local")
+    columns = ("code", "shipment", "warehouse", "scenario", "db_status", "packed")
     tree_frame = ttk.Frame(packing_tab)
     tree_frame.pack(fill="both", expand=True)
     tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse", height=18)
     headings = {
         "code": "Consignment", "shipment": "Shipment / order", "warehouse": "Warehouse",
         "scenario": "Scenario from DB", "db_status": "DB status", "packed": "Packed qty",
-        "local": "Scan & Pack state",
     }
     widths = {
         "code": 225, "shipment": 125, "warehouse": 190, "scenario": 190,
-        "db_status": 135, "packed": 85, "local": 185,
+        "db_status": 135, "packed": 85,
     }
     for column in columns:
         tree.heading(column, text=headings[column])
@@ -1302,9 +1269,6 @@ def run_gui(args: argparse.Namespace) -> None:
     tree.configure(yscrollcommand=scrollbar.set)
     tree.pack(side="left", fill="both", expand=True)
     scrollbar.pack(side="right", fill="y")
-    tree.tag_configure("completed", foreground="#777777")
-    tree.tag_configure("active", background="#fff4ce")
-
     def render_rows(*_args) -> None:
         tree.delete(*tree.get_children())
         selected_scenario = scenario_filter_var.get()
@@ -1316,12 +1280,11 @@ def run_gui(args: argparse.Namespace) -> None:
             database_status = " / ".join(
                 str(value) for value in (row.get("status"), row.get("shipmentStatus")) if value
             )
-            tags = ("completed",) if row.get("localCompleted") else (("active",) if row.get("active") else ())
             tree.insert(
-                "", "end", iid=row["code"], tags=tags,
+                "", "end", iid=row["code"],
                 values=(
                     row["code"], row.get("shipment", ""), row["warehouse"], row["scenario"],
-                    database_status, row["packedQty"] or "", row["localState"],
+                    database_status, row["packedQty"] or "",
                 ),
             )
         result_summary_var.set(f"{len(displayed)} shown · {len(rows)} total Myntra SOR orders")
@@ -1338,21 +1301,14 @@ def run_gui(args: argparse.Namespace) -> None:
             if scenario_filter_var.get() not in filter_values:
                 scenario_filter_var.set("All scenarios")
             render_rows()
-            current_state = read_state(Path(args.state_file))
-            locked = active_code(current_state)
-            available = sum(1 for row in rows if row.get("canPack"))
             scenario_counts: dict[str, int] = {}
             for row in rows:
                 scenario_counts[row["scenario"]] = scenario_counts.get(row["scenario"], 0) + 1
             scenario_summary = ", ".join(
                 f"{scenario}: {count}" for scenario, count in sorted(scenario_counts.items())
             )
-            if locked:
-                status_var.set(f"Retry required: {locked}")
-                log(f"Loaded all {len(rows)} Myntra SOR order(s); {locked} is locked until completion")
-            else:
-                status_var.set(f"{len(rows)} SOR order(s) · {available} available")
-                log(f"Loaded all {len(rows)} Myntra SOR order(s) from Consignment DB ({scenario_summary or 'no scenarios'})")
+            status_var.set(f"{len(rows)} SOR order(s) · all runnable")
+            log(f"Loaded all {len(rows)} runnable Myntra SOR order(s) from Consignment DB ({scenario_summary or 'no scenarios'})")
         except Exception as exc:
             status_var.set("Database unavailable")
             log(f"ERROR: {exc}")
@@ -1364,9 +1320,6 @@ def run_gui(args: argparse.Namespace) -> None:
             messagebox.showinfo("Select an order", "Choose one Myntra SOR consignment first.", parent=root)
             return None
         return str(selection[0])
-
-    def selected_row(code: str) -> dict[str, Any] | None:
-        return next((row for row in rows if row["code"] == code), None)
 
     def validate() -> None:
         code = selected()
@@ -1383,24 +1336,6 @@ def run_gui(args: argparse.Namespace) -> None:
     def start(mode: str) -> None:
         code = selected()
         if not code:
-            return
-        row = selected_row(code)
-        if row and row.get("localCompleted"):
-            messagebox.showwarning(
-                "Already completed on this PC",
-                f"{code} is shown because the GUI lists every Myntra SOR scenario, but its full Scan & Pack run was already completed on this PC.",
-                parent=root,
-            )
-            return
-        if row and not row.get("canPack"):
-            messagebox.showinfo(
-                "Another run is in progress",
-                f"Finish or resume {active_code(read_state(Path(args.state_file)))} before starting {code}.",
-                parent=root,
-            )
-            return
-        if row and row.get("active") and mode == "test":
-            messagebox.showinfo("Resume full run", f"{code} already has a full run in progress. Use Start full Scan & Pack to resume it.", parent=root)
             return
         try:
             plan = read_plan(code)
@@ -1483,7 +1418,7 @@ def run_gui(args: argparse.Namespace) -> None:
     ttk.Button(controls, text="Start full Scan & Pack", command=lambda: start("full")).pack(side="right", padx=8)
     ttk.Label(
         packing_tab,
-        text="All Myntra SOR scenarios are fetched from the Consignment DB. Rows completed on this PC remain visible but cannot be packed twice.",
+        text="Every Myntra SOR shipment can be started again at any time; local run history never blocks Scan & Pack.",
         foreground="#555",
     ).pack(anchor="w", pady=(8, 0))
     tree.bind("<Double-1>", lambda _event: start("full"))
@@ -1502,7 +1437,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-boxes", type=int, help="Test only the first 1 or 2 cartons; never writes completion")
     parser.add_argument("--auto-login", action="store_true", help="Deprecated compatibility option; sign-in is always manual")
     parser.add_argument("--yes", action="store_true", help="Skip the final PACK confirmation")
-    parser.add_argument("--force", action="store_true", help="Ignore this script's local completion marker")
+    parser.add_argument("--force", action="store_true", help="Deprecated compatibility option; repeat runs are always allowed")
     parser.add_argument("--close-on-success", action="store_true", help="Close Chrome after all cartons finish")
     parser.add_argument("--plan-only", action="store_true", help="Read and validate the plan without opening Chrome")
     parser.add_argument("--portal-only", action="store_true", help="Verify Myntra SSO and Scan & Pack readiness without packing")
